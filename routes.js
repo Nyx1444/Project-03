@@ -496,6 +496,17 @@ router.post('/save-attendance', ifNotLoggedIn, ownsCourse, async (req, res) => {
         for (const [studentId, dates] of Object.entries(attendance)) {
             for (const [date, status] of Object.entries(dates)) {
                 if (status) {
+                    // ตรวจสอบว่ามีการบันทึกการเข้าเรียนสำหรับวันนี้แล้วหรือไม่
+                    const [[existingAttendance]] = await connection.execute(`
+                        SELECT * FROM attendance
+                        WHERE course_code = ? AND section = ? AND student_id = ? AND date = ?
+                    `, [courseCode, section, studentId, date]);
+
+                    if (existingAttendance) {
+                        console.log(`Attendance already exists for student ${studentId} on ${date}. Skipping.`);
+                        continue;
+                    }
+
                     const [[rule]] = await connection.execute(`
                         SELECT * FROM attendance_rules
                         WHERE course_code = ? AND section = ? AND date = ?
@@ -519,9 +530,9 @@ router.post('/save-attendance', ifNotLoggedIn, ownsCourse, async (req, res) => {
                         calculatedStatus = 'absent';
                     }
 
-                    // ใช้ INSERT IGNORE เพื่อไม่อัพเดตข้อมูลที่มีอยู่แล้ว
+                    // บันทึกข้อมูลการเข้าเรียน
                     await connection.execute(`
-                        INSERT IGNORE INTO attendance (course_code, section, student_id, date, status)
+                        INSERT INTO attendance (course_code, section, student_id, date, status)
                         VALUES (?, ?, ?, ?, ?)
                     `, [courseCode, section, studentId, date, calculatedStatus]);
                 }
@@ -546,11 +557,18 @@ router.post('/save-attendance', ifNotLoggedIn, ownsCourse, async (req, res) => {
                 `, [courseCode, section]);
 
                 for (const student of students) {
-                    // ใช้ INSERT IGNORE สำหรับนักเรียนที่ยังไม่มีข้อมูลการเข้าเรียน
-                    await connection.execute(`
-                        INSERT IGNORE INTO attendance (course_code, section, student_id, date, status)
-                        VALUES (?, ?, ?, CURDATE(), 'absent')
+                    // ตรวจสอบอีกครั้งก่อนบันทึกสถานะ 'absent'
+                    const [[existingAttendance]] = await connection.execute(`
+                        SELECT * FROM attendance
+                        WHERE course_code = ? AND section = ? AND student_id = ? AND date = CURDATE()
                     `, [courseCode, section, student.student_id]);
+
+                    if (!existingAttendance) {
+                        await connection.execute(`
+                            INSERT INTO attendance (course_code, section, student_id, date, status)
+                            VALUES (?, ?, ?, CURDATE(), 'absent')
+                        `, [courseCode, section, student.student_id]);
+                    }
                 }
             }
         }
@@ -709,7 +727,7 @@ const markAbsentStudents = async (courseCode, section, date) => {
     }
 };
 
-// Edit antendance
+// Edit antendance rules
 router.put('/api/attendance-rules/:id', ifNotLoggedIn, async (req, res) => {
     const { id } = req.params;
     const { courseCode, section, date, presentUntil, lateUntil } = req.body;
@@ -843,16 +861,20 @@ router.post('/log_attendance', async (req, res) => {
         );
 
         let calculatedStatus = 'absent';
+        let shouldUpdateExisting = false;
 
         if (rule) {
             const presentUntil = new Date(`${schedule_date}T${rule.present_until}`);
             const lateUntil = new Date(`${schedule_date}T${rule.late_until}`);
-            const now = new Date(`${schedule_date}T${schedule_time}`);
+            const checkInTime = new Date(`${schedule_date}T${schedule_time}`);
 
-            if (now <= presentUntil) {
+            if (checkInTime <= presentUntil) {
                 calculatedStatus = 'present';
-            } else if (now <= lateUntil) {
+            } else if (checkInTime <= lateUntil) {
                 calculatedStatus = 'late';
+            } else {
+                calculatedStatus = 'absent';
+                shouldUpdateExisting = true; // อัพเดทเวลาเช็คอินแม้สถานะเป็น 'absent'
             }
         }
 
@@ -862,9 +884,42 @@ router.post('/log_attendance', async (req, res) => {
             [id_number, major, minor, schedule_date, schedule_time]
         );
 
-        // ใช้ INSERT IGNORE เพื่อไม่อัพเดตข้อมูลที่มีอยู่แล้ว
-        const [result] = await connection.execute(`
-            INSERT IGNORE INTO attendance (course_code, section, student_id, date, status, check_in_time)
+        // ตรวจสอบว่ามีการบันทึกการเข้าเรียนสำหรับวันนี้แล้วหรือไม่
+        const [[existingAttendance]] = await connection.execute(`
+            SELECT * FROM attendance
+            WHERE course_code = ? AND section = ? AND student_id = ? AND date = ?
+        `, [course_code, section, id_number, schedule_date]);
+
+        if (existingAttendance) {
+            if (shouldUpdateExisting) {
+                // อัพเดทเฉพาะเวลาเช็คอิน โดยไม่เปลี่ยนสถานะ
+                await connection.execute(`
+                    UPDATE attendance 
+                    SET check_in_time = ?
+                    WHERE course_code = ? AND section = ? AND student_id = ? AND date = ?
+                `, [schedule_time, course_code, section, id_number, schedule_date]);
+
+                await connection.commit();
+                return res.status(200).json({
+                    message: 'Attendance updated with new check-in time',
+                    newRecordCreated: false,
+                    status: existingAttendance.status,
+                    checkInTime: schedule_time
+                });
+            } else {
+                await connection.commit();
+                return res.status(200).json({
+                    message: 'Attendance already recorded for this date',
+                    newRecordCreated: false,
+                    status: existingAttendance.status,
+                    checkInTime: existingAttendance.check_in_time
+                });
+            }
+        }
+
+        // บันทึกข้อมูลการเข้าเรียนใหม่
+        await connection.execute(`
+            INSERT INTO attendance (course_code, section, student_id, date, status, check_in_time)
             VALUES (?, ?, ?, ?, ?, ?)
         `, [course_code, section, id_number, schedule_date, calculatedStatus, schedule_time]);
 
@@ -872,7 +927,9 @@ router.post('/log_attendance', async (req, res) => {
 
         res.status(200).json({
             message: 'Attendance recorded successfully',
-            newRecordCreated: result.affectedRows > 0
+            newRecordCreated: true,
+            status: calculatedStatus,
+            checkInTime: schedule_time
         });
     } catch (error) {
         await connection.rollback();
@@ -882,7 +939,6 @@ router.post('/log_attendance', async (req, res) => {
         connection.release();
     }
 });
-
 // ล็อกอินแอพ
 router.post('/login', async (req, res) => {
     const { id_number, password } = req.body;
